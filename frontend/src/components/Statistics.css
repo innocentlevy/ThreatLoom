@@ -1,0 +1,122 @@
+.stats-details {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+    padding: 1rem;
+}
+
+.stats-overview {
+    display: flex;
+    gap: 2rem;
+}
+
+.stats-card {
+    flex: 1;
+    background: #fff;
+    border-radius: 8px;
+    padding: 1.5rem;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    text-align: center;
+}
+
+.stats-card h4 {
+    margin: 0 0 0.5rem;
+    color: #666;
+    font-size: 1rem;
+    font-weight: 500;
+}
+
+.stats-value {
+    font-size: 2rem;
+    font-weight: 600;
+    color: #2196f3;
+}
+
+.stats-section {
+    flex: 1;
+    min-width: 300px;
+    background: #fff;
+    border-radius: 8px;
+    padding: 1.5rem;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.stats-section h4 {
+    margin: 0 0 1rem;
+    color: #333;
+    font-size: 1.2rem;
+}
+
+.protocol-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.protocol-item {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.protocol-name {
+    width: 60px;
+    font-weight: 500;
+}
+
+.protocol-bar {
+    flex: 1;
+    height: 8px;
+    background: #eee;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.protocol-bar-fill {
+    height: 100%;
+    background: #2196f3;
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+
+.protocol-percentage {
+    width: 40px;
+    text-align: right;
+    color: #666;
+}
+
+.talkers-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.talker-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem;
+    background: #f5f5f5;
+    border-radius: 4px;
+}
+
+.talker-ip {
+    font-family: monospace;
+    color: #333;
+}
+
+.talker-packets {
+    color: #666;
+    font-size: 0.9rem;
+}
+
+@media (max-width: 768px) {
+    .stats-overview {
+        flex-direction: column;
+        gap: 1rem;
+    }
+
+    .stats-section {
+        min-width: auto;
+    }
+}
