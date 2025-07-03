@@ -37,6 +37,9 @@ class WiresharkCapture:
         self.connection_timeout = 60     # Remove connections after 60 seconds of inactivity
         self.last_seen = {}             # Last time a connection was seen
         
+        # Socket tracking
+        self.connected_sids = set()   # Track connected client SIDs
+        
         # Set up logging
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger('wireshark_siem')
@@ -47,6 +50,51 @@ class WiresharkCapture:
     def get_packet_history(self):
         """Return recent packet history"""
         return list(self.packet_buffer)
+
+    @staticmethod
+    def get_interfaces():
+        """Get list of available network interfaces using tshark with sudo"""
+        try:
+            # First try without sudo
+            try:
+                process = subprocess.run(['tshark', '-D'],
+                                       capture_output=True,
+                                       text=True,
+                                       check=True)
+            except subprocess.CalledProcessError:
+                # If that fails, try with sudo
+                process = subprocess.run(['sudo', '-n', 'tshark', '-D'],
+                                       capture_output=True,
+                                       text=True,
+                                       check=True)
+            
+            interfaces = []
+            for line in process.stdout.strip().split('\n'):
+                # tshark -D output format is: "1. en0 (Wi-Fi)" or similar
+                if line:
+                    # Split on first period and strip whitespace
+                    parts = line.split('.', 1)
+                    if len(parts) == 2:
+                        interface_info = parts[1].strip()
+                        # Extract interface name (everything before the space or parenthesis)
+                        interface_name = interface_info.split(' ')[0]
+                        interfaces.append({
+                            'name': interface_name,
+                            'description': interface_info
+                        })
+            
+            if not interfaces:
+                raise Exception('No network interfaces found')
+                
+            return interfaces
+            
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr or str(e)
+            if 'permission denied' in str(error_msg).lower():
+                raise Exception('Permission denied. Please make sure you have sudo privileges to run tshark.')
+            raise Exception(f'Failed to get network interfaces: {error_msg}')
+        except Exception as e:
+            raise Exception(f'Error getting network interfaces: {str(e)}')
 
     def get_alert_history(self):
         """Return recent alert history"""
@@ -101,39 +149,70 @@ class WiresharkCapture:
                 # Parse timestamp - tshark gives us epoch time
                 timestamp = datetime.fromtimestamp(float(fields[0]))
                 
-                # Get protocol from tshark's protocol column and frame.protocols
-                protocol_col = fields[9] if len(fields) > 9 else ''
-                protocols_stack = fields[-1] if len(fields) > 14 else ''
+                # Extract protocol information from various fields
+                protocol_col = fields[7] if len(fields) > 7 else ''
+                protocols_stack = fields[8] if len(fields) > 8 else ''
+                ip_proto = fields[9] if len(fields) > 9 else ''
+                tls_info = fields[10] if len(fields) > 10 else ''
+                http_info = fields[11] if len(fields) > 11 else ''
+                dns_info = fields[12] if len(fields) > 12 else ''
                 
-                # Extract protocol name using these rules:
-                # 1. If protocol column has a name, use the first word (e.g., 'TCP', 'DNS', 'TLS')
-                # 2. If not, look at the protocol stack and use the highest layer protocol
-                # 3. If neither works, use a generic name
+                # Determine protocol using protocol stack
+                protocol_name = 'OTHER'
+                protocols_found = set()
+                
+                # Check protocol stack first as it contains all layers
+                if protocols_stack:
+                    stack = protocols_stack.upper()
+                    # Common protocols to look for
+                    protocol_checks = [
+                        'ARP', 'ICMP', 'TCP', 'UDP',  # Lower layer protocols
+                        'DNS', 'HTTP', 'HTTPS', 'TLS', 'SSH',  # Application protocols
+                        'DHCP', 'SMTP', 'FTP', 'TELNET', 'NTP'  # Additional protocols
+                    ]
+                    
+                    for proto in protocol_checks:
+                        if proto in stack:
+                            protocols_found.add(proto)
+                
+                # Add protocol from column if not already found
                 if protocol_col and not protocol_col.isdigit():
-                    protocol_name = protocol_col.split()[0].upper()
-                elif protocols_stack:
-                    # Get the last (highest layer) protocol from the stack
-                    protocols = protocols_stack.split(':')[-1].upper()
-                    protocol_name = protocols.split(',')[0] if ',' in protocols else protocols
-                else:
-                    # Fallback to mapping IP protocol numbers
+                    proto = protocol_col.split()[0].upper()
+                    if proto in {'TCP', 'UDP', 'ICMP', 'DNS', 'HTTP', 'HTTPS', 'TLS', 'SSH', 'ARP'}:
+                        protocols_found.add(proto)
+                
+                # Check specific protocol fields
+                if dns_info:
+                    protocols_found.add('DNS')
+                if http_info:
+                    protocols_found.add('HTTP')
+                if tls_info:
+                    protocols_found.add('TLS')
+                
+                # Check IP protocol numbers
+                if ip_proto:
                     protocol_map = {
                         '1': 'ICMP',
                         '6': 'TCP',
-                        '17': 'UDP',
-                        '2': 'IGMP',
-                        '8': 'EGP',
-                        '9': 'IGP',
-                        '47': 'GRE',
-                        '50': 'ESP',
-                        '51': 'AH',
-                        '58': 'ICMPv6',
-                        '89': 'OSPF',
-                        '103': 'PIM',
-                        '132': 'SCTP'
+                        '17': 'UDP'
                     }
-                    protocol = fields[8] if len(fields) > 8 else ''
-                    protocol_name = protocol_map.get(protocol, 'IP')
+                    if ip_proto in protocol_map:
+                        protocols_found.add(protocol_map[ip_proto])
+                
+                # Choose the most relevant protocol to display
+                # Prioritize application layer protocols if present
+                app_protocols = {'DNS', 'HTTP', 'HTTPS', 'TLS', 'SSH', 'FTP', 'SMTP'}
+                transport_protocols = {'TCP', 'UDP'}
+                network_protocols = {'ICMP', 'ARP'}
+                
+                if protocols_found & app_protocols:
+                    protocol_name = next(iter(protocols_found & app_protocols))
+                elif protocols_found & transport_protocols:
+                    protocol_name = next(iter(protocols_found & transport_protocols))
+                elif protocols_found & network_protocols:
+                    protocol_name = next(iter(protocols_found & network_protocols))
+                elif protocols_found:
+                    protocol_name = next(iter(protocols_found))
 
                 # Create packet object with properly formatted timestamp
                 packet_data = {
@@ -145,7 +224,7 @@ class WiresharkCapture:
                     'destination_port': int(fields[4]) if fields[4] and fields[4].isdigit() else None,
                     'protocol': protocol_name,
                     'length': len(packet_line),
-                    'info': fields[9] if len(fields) > 9 else ''
+                    'info': fields[7] if len(fields) > 7 else ''
                 }
                 
                 # Track connections and IPs
@@ -184,33 +263,46 @@ class WiresharkCapture:
                 self.total_packets += 1
                 self.last_second_packets += 1
                 
+                # Update statistics every second
                 current_time = datetime.now()
                 time_diff = (current_time - self.last_stats_update).total_seconds()
                 
-                if time_diff >= 1.0:  # Update stats every second
+                if time_diff >= 1.0:
+                    # Calculate packets per second
                     self.packets_per_second = self.last_second_packets / time_diff
                     self.last_second_packets = 0
                     self.last_stats_update = current_time
                     
-                    # Get protocol distribution
+                    # Get protocol distribution from recent packets
                     protocols = {}
                     for p in self.packet_buffer:
-                        proto = p['protocol']
-                        protocols[proto] = protocols.get(proto, 0) + 1
+                        proto = p.get('protocol', 'OTHER')
+                        if proto:
+                            protocols[proto] = protocols.get(proto, 0) + 1
                     
+                    # Sort protocols by count and take top 5
+                    sorted_protocols = sorted(protocols.items(), key=lambda x: x[1], reverse=True)[:5]
                     protocol_dist = [
                         {'name': proto, 'value': count}
-                        for proto, count in protocols.items()
+                        for proto, count in sorted_protocols
                     ]
+                    
+                    # Ensure we have at least one protocol
+                    if not protocol_dist:
+                        protocol_dist = [{'name': 'NO DATA', 'value': 0}]
+                    
+                    # Calculate packets per second as integer
+                    pps = int(round(self.packets_per_second))
                     
                     # Emit statistics update
                     stats = {
                         'totalPackets': self.total_packets,
-                        'packetsPerSecond': round(self.packets_per_second, 2),
+                        'packetsPerSecond': pps,
                         'protocolDistribution': protocol_dist,
                         'activeConnections': len(self.active_connections),
                         'uniqueIPs': len(self.unique_ips)
                     }
+                    self.logger.info(f'Emitting stats update: {stats}')
                     self.socketio.emit('statistics_update', stats)
                     
             except (ValueError, IndexError) as e:
@@ -232,34 +324,58 @@ class WiresharkCapture:
         except Exception as e:
             self.logger.error(f"Error processing packet: {str(e)}")
 
+    def start(self, interface, sudo_password):
+        """Start packet capture on the specified interface"""
+        if self.running:
+            return {"status": "error", "message": "Capture already running"}
+
+        if not self.connected_sids:
+            return {"status": "error", "message": "No clients connected"}
+
+        self.interface = interface
+        self.running = True
+
+        # Create and start capture thread
+        self.thread = threading.Thread(target=self._capture_packets, args=(sudo_password,))
+        self.thread.daemon = True
+        self.thread.start()
+
+        # Wait a short time to check if capture started successfully
+        time.sleep(0.5)
+        if not self.running or not self.process:
+            self.running = False
+            return {"status": "error", "message": "Failed to start capture"}
+
+        # Notify all connected clients
+        self.socketio.emit('capture_started', {
+            'status': 'running',
+            'interface': interface
+        })
+
+        return {"status": "success", "message": "Capture started successfully"}
+
     def _get_protocol_distribution(self):
         """Get distribution of protocols in recent packets"""
-        protocols = {'TCP': 0, 'UDP': 0, 'ICMP': 0, 'Other': 0}
+        protocols = {}
         for packet in self.packet_buffer:
             proto = packet.get('protocol', 'Other')
-            protocols[proto] = protocols.get(proto, 0) + 1
-        return protocols
+            if proto and not proto.isdigit():  # Ensure we have a valid protocol name
+                proto = proto.upper()  # Normalize protocol names to uppercase
+                protocols[proto] = protocols.get(proto, 0) + 1
+            else:
+                protocols['Other'] = protocols.get('Other', 0) + 1
+            
+        # Sort protocols by count and take top 10 to avoid cluttering the chart
+        sorted_protocols = sorted(protocols.items(), key=lambda x: x[1], reverse=True)[:10]
+        return [{'name': proto, 'value': count} for proto, count in sorted_protocols]
 
-    def _capture_packets(self):
+    def _capture_packets(self, sudo_password):
         """Start capturing packets using tshark"""
-        self.logger.info("Starting packet capture thread")
         try:
-            # Check if tshark is available and list interfaces
-            try:
-                subprocess.check_output(['which', 'tshark'])
-                self.logger.info("tshark is available")
-                # List available interfaces
-                interfaces = subprocess.check_output(['tshark', '-D']).decode().strip().split('\n')
-                self.logger.info(f"Available interfaces: {interfaces}")
-            except subprocess.CalledProcessError as e:
-                error_msg = "tshark is not installed. Please install it using 'brew install wireshark'"
-                self.logger.error(error_msg)
-                raise Exception(error_msg)
-
             # Build tshark command with enhanced capture options
             cmd = [
-                'tshark',
-                '-i', self.interface,
+                'sudo', '-S', 'tshark',
+                '-i', self.interface,  # Use passed interface parameter
                 '-T', 'fields',
                 '-E', 'separator=,',
                 '-E', 'quote=d',
@@ -269,7 +385,7 @@ class WiresharkCapture:
                 '-P',  # Print packet summary even when writing to file
                 '-Q',  # Quiet mode, only print packet lines
                 '-t', 'e',  # Print time as epoch
-                '-f', 'ip',  # Capture all IP traffic
+                # No filter - capture all protocols
                 '-e', 'frame.time_epoch',  # Timestamp
                 '-e', 'ip.src',  # Source IP
                 '-e', 'ip.dst',  # Destination IP
@@ -286,92 +402,65 @@ class WiresharkCapture:
                 '-e', 'frame.protocols'  # Full protocol stack
             ]
             
-            self.logger.info("Checking tshark version...")
-            version_cmd = ['sudo', 'tshark', '--version']
-            version = subprocess.check_output(version_cmd, universal_newlines=True)
-            self.logger.info(f"Using tshark version:\n{version}")
-            
             self.logger.info(f"Starting tshark with command: {' '.join(cmd)}")
             
-            # Start tshark process with proper permissions
-            try:
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,  # Line buffered
-                    universal_newlines=True
-                )
-            except PermissionError:
-                # If permission denied, try with sudo
-                cmd.insert(0, 'sudo')
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,  # Line buffered
-                    universal_newlines=True
-                )
+            # Start tshark process
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1  # Line buffered
+            )
             
-            # Check for immediate startup errors
-            time.sleep(1)  # Give tshark a moment to start
+            # Send sudo password
+            if not self.process.stdin:
+                self.logger.error('No stdin pipe available')
+                self.running = False
+                return
+            
+            self.process.stdin.write(sudo_password + '\n')
+            self.process.stdin.flush()
+        
+            # Wait a short time to check if process started
+            time.sleep(0.1)
             if self.process.poll() is not None:
-                stderr_output = self.process.stderr.read()
-                raise Exception(f'tshark failed to start: {stderr_output}')
+                error = self.process.stderr.read() if self.process.stderr else 'Process failed to start'
+                self.logger.error(f'tshark process failed to start: {error}')
+                self.running = False
+                return
 
-            self.logger.info("Packet capture started")
-            
-            # Start a thread to monitor stderr
-            def monitor_stderr():
-                while self.running and self.process and self.process.poll() is None:
-                    line = self.process.stderr.readline()
-                    if line:
-                        self.logger.error(f"tshark error: {line.strip()}")
-            
-            stderr_thread = threading.Thread(target=monitor_stderr)
-            stderr_thread.daemon = True
-            stderr_thread.start()
-            
             # Start reading packets
-            self.logger.info('Starting to read packets from tshark output')
-            while self.running:
-                line = self.process.stdout.readline().strip()
-                if line:
-                    self.logger.debug(f'Raw tshark output: {line}')
-                    self._process_packet(line)
-                elif self.process.poll() is not None:
-                    error = self.process.stderr.read()
-                    self.logger.error(f'tshark process exited unexpectedly with output: {error}')
-                    break
-                    
+            while self.running and self.process and self.process.poll() is None:
+                try:
+                    line = self.process.stdout.readline().strip()
+                    if line:
+                        self._process_packet(line)
+                except Exception as e:
+                    self.logger.error(f"Error reading packet: {str(e)}")
+                    continue
+
+            # Check why we exited the loop
+            if self.process and self.process.poll() is not None:
+                error = self.process.stderr.read() if self.process.stderr else 'Process terminated'
+                self.logger.error(f'tshark process exited unexpectedly: {error}')
+                self.running = False
+
         except Exception as e:
             self.logger.error(f"Capture error: {str(e)}")
             self.running = False
         finally:
+            # Ensure cleanup
             if self.process:
-                self.process.terminate()
-                self.process = None
-
-    def start(self, interface='en0'):
-        self.logger.info(f"Starting packet capture on interface {interface}...")
-        if not self.running:
-            try:
-                self.running = True
-                self.interface = interface  # Store interface for _capture_packets
-                self.thread = threading.Thread(target=self._capture_packets)
-                self.thread.daemon = True
-                self.thread.start()
-                self.logger.info("Packet capture thread started successfully")
-                return {"status": "success", "message": "Capture started"}
-            except Exception as e:
-                self.running = False
-                self.logger.error(f"Failed to start packet capture: {str(e)}")
-                return {"status": "error", "message": f"Failed to start capture: {str(e)}"}
-        else:
-            self.logger.warning("Packet capture already running")
-            return {"status": "error", "message": "Capture already running"}
+                try:
+                    self.process.terminate()
+                    self.process.wait(timeout=1)
+                except Exception as cleanup_error:
+                    self.logger.error(f"Error during cleanup: {cleanup_error}")
+                finally:
+                    self.process = None
+            self.running = False
 
     def _clean_old_connections(self, current_time):
         """Remove connections that haven't been seen recently"""
@@ -382,22 +471,35 @@ class WiresharkCapture:
         for conn in old_connections:
             self.active_connections.discard(conn)
             del self.last_seen[conn]
-    
+
     def stop(self):
         """Stop packet capture"""
+        if not self.running:
+            return {"status": "error", "message": "Capture not running"}
+
         self.running = False
+
+        # Stop tshark process
         if self.process:
-            self.process.terminate()
             try:
-                self.process.wait(timeout=1)
+                # Get tshark pid
+                pid = self.process.pid
+                # Use sudo kill to stop tshark
+                subprocess.run(['sudo', 'kill', str(pid)], check=True)
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    subprocess.run(['sudo', 'kill', '-9', str(pid)], check=True)
+                except Exception as e:
+                    self.logger.error(f"Error force killing process: {str(e)}")
             except Exception as e:
-                self.logger.error(f"Error stopping tshark process: {str(e)}")
+                self.logger.error(f"Error stopping process: {str(e)}")
             finally:
                 self.process = None
 
         if self.thread:
+            self.logger.info("Waiting for capture thread to finish...")
             try:
-                self.logger.info("Waiting for capture thread to finish...")
                 self.thread.join(timeout=5)
                 if self.thread.is_alive():
                     self.logger.warning("Capture thread did not finish gracefully")
@@ -411,13 +513,19 @@ class WiresharkCapture:
         self.last_seen.clear()
         self.unique_ips.clear()
 
+        # Notify all connected clients
+        self.socketio.emit('capture_stopped', {
+            'status': 'stopped',
+            'interface': self.interface
+        })
+
         self.logger.info("Packet capture stopped successfully")
         return {"status": "success", "message": "Capture stopped"}
 
     def add_ip_to_whitelist(self, ip):
         """Add an IP to the analyzer's whitelist"""
-        return self.analyzer.add_to_whitelist(ip)
+        self.analyzer.add_ip_to_whitelist(ip)
 
     def remove_ip_from_whitelist(self, ip):
         """Remove an IP from the analyzer's whitelist"""
-        self.analyzer.remove_from_whitelist(ip)
+        self.analyzer.remove_ip_from_whitelist(ip)

@@ -10,7 +10,7 @@ import {
   Typography,
   Box
 } from '@mui/material';
-import { Alert } from '../types';
+import { Alert } from '../models/alert';
 import { socketService } from '../services/socket';
 
 interface AlertMap {
@@ -25,8 +25,8 @@ export const AlertMapping: React.FC = () => {
   const [alertMap, setAlertMap] = useState<AlertMap>({});
 
   useEffect(() => {
-    // Subscribe to security alerts
-    const unsubscribe = socketService.onAlert((alert: Alert) => {
+    // Create alert handler
+    const handleAlert = (alert: Alert) => {
       const sourceIp = extractIpFromAlert(alert);
       if (sourceIp) {
         setAlertMap(prevMap => {
@@ -44,10 +44,14 @@ export const AlertMapping: React.FC = () => {
           return newMap;
         });
       }
-    });
+    };
 
+    // Subscribe to security alerts
+    socketService.onAlert(handleAlert);
+
+    // Cleanup function
     return () => {
-      unsubscribe();
+      socketService.offAlert(handleAlert);
     };
   }, []);
 

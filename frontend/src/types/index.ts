@@ -29,6 +29,12 @@ export interface Statistics {
         name: string;
         value: number;
     }[];
+    activeConnections: number;
+    uniqueHosts: number;
+    packetsAnalyzed: number;
+    alertsGenerated: number;
+    totalBytes: number;
+    bytesPerSecond: number;
 }
 
 export interface SystemStatus {

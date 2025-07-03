@@ -2,40 +2,65 @@ import logging
 import logging.config
 import os
 import subprocess
+import json
 from datetime import datetime, timedelta
 from collections import defaultdict
 from flask import Flask, request, jsonify
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, disconnect
 from capture import WiresharkCapture
 from analyzer import PacketAnalyzer
 from config import ANALYZER_CONFIG, LOGGING_CONFIG
 from api_docs import swagger_ui_blueprint, SWAGGER_URL, get_api_spec
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, JWTManager
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, JWTManager, decode_token
 from test_endpoints import test_bp
 from flask_cors import CORS
 from models import db, User
 from passlib.hash import pbkdf2_sha256
 from functools import wraps
 from auth import register_user, admin_required
+from sudo_auth import verify_sudo_password
+
+def authenticated_only(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if not request.sid:
+            logger.error('Socket auth error: No session ID')
+            disconnect()
+            return False
+
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f'Socket auth error: {str(e)}')
+            disconnect()
+            return False
+    return wrapped
 
 # Initialize logging
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
 
-# Initialize Flask app
+# Initialize Flask app configuration
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'your-jwt-secret-key')
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'your-jwt-secret-key-here')
+app.config['JWT_TOKEN_LOCATION'] = ['headers']
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
+app.config['JWT_HEADER_TYPE'] = 'Bearer'
+app.config['JWT_ERROR_MESSAGE_KEY'] = 'error'
+app.config['JWT_IDENTITY_CLAIM'] = 'sub'
+app.config['JWT_DECODE_ALGORITHMS'] = ['HS256']
+
+# Database configuration
 db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wireshark_siem.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///' + db_path)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Initialize extensions
-db.init_app(app)
-CORS(app)
+# Initialize extensions in correct order
 jwt = JWTManager(app)
+db.init_app(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Register test endpoints
 app.register_blueprint(test_bp)
@@ -43,11 +68,33 @@ app.register_blueprint(test_bp)
 # Register Swagger UI blueprint
 app.register_blueprint(swagger_ui_blueprint, url_prefix=SWAGGER_URL)
 
+# JWT error handlers
+@jwt.invalid_token_loader
+def invalid_token_callback(error_string):
+    return jsonify({
+        'error': 'Invalid token',
+        'message': error_string
+    }), 401
+
+@jwt.unauthorized_loader
+def missing_token_callback(error_string):
+    return jsonify({
+        'error': 'Authorization required',
+        'message': error_string
+    }), 401
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    return jsonify({
+        'error': 'Token has expired',
+        'message': 'Please log in again'
+    }), 401
+
 @app.route('/api/swagger.json')
 def swagger():
     return jsonify(get_api_spec())
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=True, engineio_logger=True)
 
 def create_default_admin():
     """Create a default admin user if none exists"""
@@ -179,7 +226,14 @@ def login():
             return jsonify({'error': 'Error during authentication'}), 500
         
         logger.info('Password check successful for user: ' + username)
-        access_token = create_access_token(identity=user.id)
+        # Create access token with user ID as identity (convert to string)
+        access_token = create_access_token(
+            identity=str(user.id),
+            additional_claims={
+                'username': user.username,
+                'is_admin': user.is_admin
+            }
+        )
         response = {
             'access_token': access_token,
             'user': {
@@ -188,6 +242,7 @@ def login():
                 'is_admin': user.is_admin
             }
         }
+        logger.info('Generated access token for user: %s', username)
         logger.info('Login response prepared: ' + str(response))
         return jsonify(response)
     except Exception as e:
@@ -212,38 +267,32 @@ def register():
     
     return jsonify({'message': 'User registered successfully'})
 
-@app.route('/api/interfaces')
+@app.route('/api/interfaces', methods=['GET'])
+@jwt_required()
 def get_interfaces():
     try:
-        interfaces = subprocess.check_output(['tshark', '-D']).decode().strip().split('\n')
-        # Parse interface names from tshark output (format: "1. en0 (Wi-Fi)")
-        parsed_interfaces = []
-        for line in interfaces:
-            parts = line.split('.')
-            if len(parts) != 2:
-                continue
-            id_part = parts[0].strip()
-            rest = parts[1].strip()
+        # Get current user identity
+        current_user_id = get_jwt_identity()
+        if not current_user_id or not isinstance(current_user_id, str):
+            return jsonify({'error': 'Invalid authentication token'}), 401
             
-            # Extract name without description
-            name = rest.split()[0].strip()
-            # Get description if exists (everything in parentheses)
-            description = ''
-            if '(' in rest and ')' in rest:
-                description = rest[rest.find('(')+1:rest.find(')')]
+        # Convert string ID back to integer
+        try:
+            user_id = int(current_user_id)
+        except ValueError:
+            return jsonify({'error': 'Invalid user ID in token'}), 401
             
-            parsed_interfaces.append({
-                'id': id_part,
-                'name': name,
-                'description': description
-            })
-        
+        # Get interfaces
+        interfaces = WiresharkCapture.get_interfaces()
         return jsonify({
-            'interfaces': parsed_interfaces
+            'interfaces': interfaces
         })
-    except subprocess.CalledProcessError as e:
-        logger.error('Failed to get interfaces: {}'.format(str(e)))
-        return jsonify({'error': 'Failed to get network interfaces'}), 500
+    except Exception as e:
+        error_msg = str(e)
+        status_code = 403 if 'permission denied' in error_msg.lower() else 500
+        return jsonify({
+            'error': error_msg
+        }), status_code
 
 @app.route('/api/status')
 @jwt_required()
@@ -254,17 +303,32 @@ def get_status():
     })
 
 @app.route('/api/statistics')
+@jwt_required()
 def get_statistics():
-    protocol_distribution = [
-        {'name': proto, 'value': count}
-        for proto, count in stats['protocols'].items()
-    ]
-    
-    return jsonify({
-        'totalPackets': stats['total_packets'],
-        'packetsPerSecond': stats['total_packets'] / ((datetime.now() - stats['start_time']).seconds + 1) if stats['start_time'] else 0,
-        'protocolDistribution': protocol_distribution
-    })
+    try:
+        if not stats.get('protocols') or not stats.get('total_packets') or not stats.get('start_time'):
+            return jsonify({
+                'totalPackets': 0,
+                'packetsPerSecond': 0,
+                'protocolDistribution': []
+            })
+
+        protocol_distribution = [
+            {'name': proto, 'value': count}
+            for proto, count in stats['protocols'].items()
+        ]
+        
+        elapsed_seconds = (datetime.now() - stats['start_time']).seconds + 1
+        packets_per_second = stats['total_packets'] / elapsed_seconds if elapsed_seconds > 0 else 0
+
+        return jsonify({
+            'totalPackets': stats['total_packets'],
+            'packetsPerSecond': packets_per_second,
+            'protocolDistribution': protocol_distribution
+        })
+    except Exception as e:
+        logger.error(f'Error getting statistics: {str(e)}')
+        return jsonify({'error': 'Failed to retrieve statistics'}), 500
 
 @app.route('/api/alerts')
 def get_alerts():
@@ -302,34 +366,91 @@ def manage_whitelist():
             'whitelist': list(capture.get_whitelist())
         })
 
+@app.route('/api/sudo-auth', methods=['POST'])
+@jwt_required()
+def verify_sudo():
+    data = request.get_json()
+    if not data or 'password' not in data:
+        return jsonify({'error': 'Password is required'}), 400
+    
+    success, message = verify_sudo_password(data['password'])
+    if success:
+        return jsonify({'message': message})
+    return jsonify({'error': message}), 401
+
 @socketio.on('start_capture')
+@authenticated_only
 def handle_start_capture(data=None):
-    # Default to en0 (typical external interface on macOS) if no interface specified
-    interface = data.get('interface', 'en0') if data else 'en0'
-    logger.info('Starting capture on interface: {}'.format(interface))
     try:
-        # Get list of available interfaces
-        interfaces = subprocess.check_output(['tshark', '-D']).decode().strip().split('\n')
-        logger.info('Available interfaces: {}'.format(interfaces))
+        logger.info('Received start_capture event with data: %s', data)
         
-        # Start capture
-        result = capture.start(interface=interface)
-        if result.get('status') == 'success':
-            logger.info('Packet capture started successfully')
-            socketio.emit('capture_status', {'status': 'running', 'interface': interface})
-            socketio.emit('capture_started')
-        else:
-            error_msg = result.get('message', 'Unknown error starting capture')
-            logger.error('Failed to start capture: {}'.format(error_msg))
-            socketio.emit('capture_error', {'message': error_msg})
+        if not data or 'interface' not in data:
+            error = 'Interface name is required'
+            logger.error(error)
+            socketio.emit('capture_error', error)
+            return {'status': 'error', 'message': error}
+            
+        if 'sudoPassword' not in data:
+            error = 'Sudo password is required'
+            logger.error(error)
+            socketio.emit('capture_error', error)
+            return {'status': 'error', 'message': error}
+
+        interface = data['interface']
+        sudo_password = data['sudoPassword']
+        
+        # Verify sudo password
+        logger.info('Verifying sudo password...')
+        success, message = verify_sudo_password(sudo_password)
+        if not success:
+            logger.error('Sudo verification failed: %s', message)
+            socketio.emit('capture_error', 'Invalid sudo password')
+            return {'status': 'error', 'message': 'Invalid sudo password'}
+
+        logger.info('Starting capture on interface %s', interface)
+
+        if capture.is_running():
+            error = 'Capture is already running'
+            logger.error(error)
+            socketio.emit('capture_error', error)
+            return {'status': 'error', 'message': error}
+
+        try:
+            # Emit early response
+            logger.info('Emitting capture_starting event...')
+            socketio.emit('capture_starting', {'interface': interface})
+            
+            # Start packet capture
+            logger.info('Starting capture with sudo password...')
+            result = capture.start(interface, sudo_password)
+            logger.info('Capture start result: %s', result)
+            
+            if result['status'] == 'success':
+                logger.info('Capture started successfully')
+                response = {'status': 'running', 'interface': interface}
+                logger.info('Emitting capture_started with: %s', response)
+                socketio.emit('capture_started', response)
+                return {'status': 'success', 'message': 'Capture started successfully'}
+            else:
+                error = result.get('message', 'Failed to start capture')
+                logger.error('Capture start failed: %s', error)
+                socketio.emit('capture_error', error)
+                return {'status': 'error', 'message': error}
+        except Exception as e:
+            error_msg = str(e)
+            logger.error('Unexpected error starting capture: %s', error_msg)
+            socketio.emit('capture_error', error_msg)
+            return {'status': 'error', 'message': error_msg}
     except Exception as e:
         error_msg = str(e)
-        logger.error('Error starting capture: {}'.format(error_msg))
-        socketio.emit('capture_error', {'message': error_msg})
+        logger.error('Unexpected error starting capture: %s', error_msg)
+        socketio.emit('capture_error', error_msg)
+        return {'status': 'error', 'message': error_msg}
 
 @socketio.on('stop_capture')
 def handle_stop_capture():
     try:
+        logger.info('Received stop_capture event')
         logger.info('Stopping capture...')
         capture.stop()
         logger.info('Capture stopped successfully')
@@ -340,24 +461,61 @@ def handle_stop_capture():
         logger.error(error_msg)
         socketio.emit('capture_error', {'message': error_msg})
 
+def authenticated_only(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if not request.args.get('auth'):
+            disconnect()
+            return False
+        try:
+            auth = json.loads(request.args.get('auth'))
+            token = auth.get('token')
+            if not token:
+                disconnect()
+                return False
+            decoded = decode_token(token)
+            if not decoded:
+                disconnect()
+                return False
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f'Socket auth error: {str(e)}')
+            disconnect()
+            return False
+    return wrapped
+
 @socketio.on('connect')
-def handle_connect():
-    logger.info('Client connected: {}'.format(request.sid))
+def handle_connect(auth):
     try:
-        # Send current status
-        if capture.is_running():
-            socketio.emit('capture_status', {'status': 'running'})
-        else:
-            socketio.emit('capture_status', {'status': 'stopped'})
-            
-        # Send any existing data
-        socketio.emit('statistics_update', get_statistics())
-        socketio.emit('packet_history', get_recent_packets())
+        if not auth or 'token' not in auth:
+            logger.error('Error in connect handler: Missing token in auth data')
+            return False
+
+        token = auth.get('token')
+        if not token:
+            logger.error('Error in connect handler: Token not found in auth data')
+            return False
+
+        try:
+            decoded = decode_token(token)
+            if not decoded:
+                logger.error('Error in connect handler: Invalid token')
+                return False
+
+            logger.info('Client connected with valid token: {}'.format(request.sid))
+            capture.connected_sids.add(request.sid)
+            return True
+        except Exception as e:
+            logger.error('Error in connect handler: Token verification failed - {}'.format(str(e)))
+            return False
     except Exception as e:
         logger.error('Error in connect handler: {}'.format(str(e)))
+        return False
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    if request.sid in capture.connected_sids:
+        capture.connected_sids.remove(request.sid)
     logger.info('Client disconnected: {}'.format(request.sid))
 
 @socketio.on('packet_captured')
@@ -368,12 +526,15 @@ def handle_packet_captured(packet):
         
         logger.debug('Packet captured: {}'.format(packet))
         
+        # Emit packet to frontend
+        socketio.emit('packet', packet)
+        
         # Analyze packet for security threats
         alerts = analyzer.analyze_packet(packet)
         
         # Emit alerts if any were detected
         for alert in alerts:
-            socketio.emit('security_alert', alert)
+            socketio.emit('alert', alert)
             
         # Always update basic statistics
         update_statistics(packet)
@@ -393,7 +554,7 @@ def handle_packet_captured(packet):
             logger.debug('Emitting statistics update: {} packets, {:.2f} pps'.format(
                 stats["total_packets"], packets_per_second))
             
-            socketio.emit('statistics_update', {
+            socketio.emit('stats', {
                 'totalPackets': stats['total_packets'],
                 'packetsPerSecond': packets_per_second,
                 'protocolDistribution': protocol_distribution

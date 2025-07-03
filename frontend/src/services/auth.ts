@@ -58,13 +58,20 @@ class AuthService {
 
   async login(username: string, password: string): Promise<boolean> {
     try {
-      console.log('Attempting login with:', { username });
+      console.log('Login request to:', `${API_URL}/login`);
+      console.log('Login payload:', { username, hasPassword: !!password });
+      
       const response = await axios.post<AuthResponse>(`${API_URL}/auth/login`, {
         username,
         password
+      }, {
+        headers: {
+          'Content-Type': 'application/json'
+        }
       });
 
-      console.log('Login response:', response.data);
+      console.log('Login response status:', response.status);
+      console.log('Login response data:', response.data);
 
       if (response.data && response.data.access_token && response.data.user) {
         console.log('Login successful, setting token and user');
@@ -86,7 +93,13 @@ class AuthService {
       console.log('Login failed: invalid response format');
       return false;
     } catch (error: any) {
-      console.error('Login failed:', error.response?.data || error);
+      console.error('Login error details:', {
+        message: error.message,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        url: error.config?.url
+      });
       this.token = null;
       this.user = null;
       localStorage.removeItem('token');

@@ -1,69 +1,83 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, KeyboardEvent, ChangeEvent, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
     AppBar,
     Box,
-    IconButton,
-    Paper,
-    Toolbar,
-    Typography,
-    Switch,
     Button,
     Collapse,
+    Dialog,
+    DialogActions,
+    DialogContent,
+    DialogContentText,
+    DialogTitle,
+    FormControl,
+    IconButton,
+    InputLabel,
+    MenuItem,
     Pagination,
+    Paper,
+    Select,
+    SelectChangeEvent,
+    Switch,
     Table,
     TableBody,
     TableCell,
     TableContainer,
     TableHead,
     TableRow,
-    Grid,
-    Select,
-    MenuItem,
-    FormControl,
-    InputLabel
+    TextField,
+    Toolbar,
+    Typography
 } from '@mui/material';
 import { AlertMapping } from './AlertMapping';
 import SecurityIcon from '@mui/icons-material/Security';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import StopIcon from '@mui/icons-material/Stop';
+import WarningIcon from '@mui/icons-material/Warning';
+import MapIcon from '@mui/icons-material/Map';
 import NetworkCheckIcon from '@mui/icons-material/NetworkCheck';
 import { socketService } from '../services/socket';
-import { PacketTable } from './PacketTable';
-import { AlertList } from './AlertList';
-import { Statistics } from './Statistics';
-import { Packet, Alert } from '../types/index';
+import { Statistics as StatsComponent } from './Statistics';
+import { Packet } from '../models/packet';
+import { Alert } from '../models/alert';
+import { Statistics } from '../models/statistics';
 import './Dashboard.css';
 
-interface NetworkInterface {
-    id: string;
-    name: string;
-    description: string;
-}
+import { NetworkInterfaceData } from '../services/socket';
 
-interface StatsData {
-    totalPackets: number;
-    packetsPerSecond: number;
-    protocolDistribution: Array<{ name: string; value: number; }>;
-}
-
-const Dashboard = () => {
+const Dashboard: React.FC = () => {
     const navigate = useNavigate();
-    const [isCapturing, setIsCapturing] = useState(false);
-    const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
+    const [error, setError] = useState<string>('');
+    const [interfaces, setInterfaces] = useState<NetworkInterfaceData[]>([]);
     const [selectedInterface, setSelectedInterface] = useState<string>('');
+    const [isCapturing, setIsCapturing] = useState<boolean>(false);
     const [packets, setPackets] = useState<Packet[]>([]);
     const [alerts, setAlerts] = useState<Alert[]>([]);
-    const [expandedPackets, setExpandedPackets] = useState(false);
-    const [expandedAlerts, setExpandedAlerts] = useState(true);
-    const [currentPage, setCurrentPage] = useState(1);
-    const [packetsPerPage] = useState(10);
-    const [stats, setStats] = useState<StatsData>({
+    const [showSudoPrompt, setShowSudoPrompt] = useState<boolean>(false);
+    const [sudoPassword, setSudoPassword] = useState<string>('');
+    const [expandedPackets, setExpandedPackets] = useState<boolean>(true);
+    const [expandedAlerts, setExpandedAlerts] = useState<boolean>(true);
+    const [expandedMapping, setExpandedMapping] = useState<boolean>(true);
+    const [currentPage, setCurrentPage] = useState<number>(1);
+    const [packetsPerPage, setPacketsPerPage] = useState<number>(10);
+    interface TransformedStats extends Omit<Statistics, 'protocolDistribution'> {
+        protocolDistribution: Array<{ name: string; value: number }>;
+    }
+
+    const [stats, setStats] = useState<TransformedStats>({
         totalPackets: 0,
         packetsPerSecond: 0,
-        protocolDistribution: []
+        protocolDistribution: [],
+        activeConnections: 0,
+        uniqueHosts: 0,
+        packetsAnalyzed: 0,
+        alertsGenerated: 0,
+        totalBytes: 0,
+        bytesPerSecond: 0
     });
-    const [error, setError] = useState<string>('');
+
 
     const handleLogout = () => {
         localStorage.removeItem('token');
@@ -72,25 +86,6 @@ const Dashboard = () => {
     };
 
 
-    const fetchInterfaces = async () => {
-        try {
-            const response = await fetch('http://localhost:5001/api/interfaces');
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-            const data = await response.json();
-            if (data.error) {
-                throw new Error(data.error);
-            }
-            setInterfaces(data.interfaces);
-            if (data.interfaces.length > 0 && !selectedInterface) {
-                setSelectedInterface(data.interfaces[0].name);
-            }
-        } catch (error) {
-            console.error('Failed to fetch interfaces:', error);
-            setError('Failed to fetch network interfaces. Make sure tshark is installed and you have necessary permissions.');
-        }
-    };
 
     const handleCaptureToggle = async () => {
         try {
@@ -98,13 +93,25 @@ const Dashboard = () => {
             if (isCapturing) {
                 console.log('Stopping capture...');
                 await socketService.stopCapture();
+                setPackets([]);
+                setStats({
+                    totalPackets: 0,
+                    packetsPerSecond: 0,
+                    protocolDistribution: [],
+                    activeConnections: 0,
+                    uniqueHosts: 0,
+                    packetsAnalyzed: 0,
+                    alertsGenerated: 0,
+                    totalBytes: 0,
+                    bytesPerSecond: 0
+                });
             } else {
                 if (!selectedInterface) {
                     setError('Please select a network interface');
                     return;
                 }
-                console.log(`Starting capture on interface ${selectedInterface}...`);
-                await socketService.startCapture({ interface: selectedInterface });
+                setSudoPassword('');
+                setShowSudoPrompt(true);
             }
         } catch (error) {
             console.error('Failed to toggle capture:', error);
@@ -113,66 +120,274 @@ const Dashboard = () => {
     };
 
     useEffect(() => {
-        const token = localStorage.getItem('token');
-        if (!token) {
-            navigate('/login');
+        const setupSocket = async () => {
+            try {
+                const token = localStorage.getItem('token');
+                if (!token) {
+                    navigate('/login');
+                    return;
+                }
+                
+                // Clear any previous error and state
+                setError('');
+                setIsCapturing(false);
+                setSudoPassword('');
+                setShowSudoPrompt(false);
+
+                // Connect to socket
+                await socketService.connect();
+                console.log('Socket connected successfully');
+                
+                // Set up event handlers
+                socketService.onConnectError((err: Error) => {
+                    console.error('Socket connection error:', err);
+                    setError(`Failed to connect to server: ${err.message}`);
+                });
+
+                socketService.onDisconnect(() => {
+                    console.log('Socket disconnected');
+                    setIsCapturing(false);
+                    setPackets([]);
+                    setStats({
+                        totalPackets: 0,
+                        packetsPerSecond: 0,
+                        protocolDistribution: [],
+                        activeConnections: 0,
+                        uniqueHosts: 0,
+                        packetsAnalyzed: 0,
+                        alertsGenerated: 0,
+                        totalBytes: 0,
+                        bytesPerSecond: 0
+                    });
+                });
+
+                socketService.onInterfaces((networkInterfaces) => {
+                    console.log('Received interfaces:', networkInterfaces);
+                    setInterfaces(networkInterfaces);
+                    if (networkInterfaces.length > 0 && !selectedInterface) {
+                        setSelectedInterface(networkInterfaces[0].name);
+                    }
+                });
+
+                socketService.onPacket((packet) => {
+                    console.log('Received packet in Dashboard:', packet);
+                    setPackets(prevPackets => {
+                        const newPackets = [packet, ...prevPackets];
+                        // Keep only the latest 1000 packets
+                        const trimmedPackets = newPackets.slice(0, 1000);
+                        console.log('Updated packets list, now has:', trimmedPackets.length);
+                        return trimmedPackets;
+                    });
+                    
+                    // Update stats immediately for smoother UI updates
+                    setStats(prevStats => {
+                        const newStats = {
+                            ...prevStats,
+                            totalPackets: prevStats.totalPackets + 1,
+                            packetsPerSecond: Math.max(1, prevStats.packetsPerSecond),
+                            totalBytes: prevStats.totalBytes + packet.length,
+                            protocolDistribution: updateProtocolDistribution(prevStats.protocolDistribution, packet.protocol)
+                        };
+                        console.log('Updated stats:', newStats);
+                        return newStats;
+                    });
+                });
+
+                // Helper function to update protocol distribution
+                const updateProtocolDistribution = (current: Array<{ name: string; value: number }>, protocol: string) => {
+                    const existing = current.find(p => p.name === protocol);
+                    if (existing) {
+                        return current.map(p => p.name === protocol ? { ...p, value: p.value + 1 } : p);
+                    } else {
+                        return [...current, { name: protocol, value: 1 }];
+                    }
+                };
+
+                // Log packet updates
+                console.log('Packets state updated, count:', packets.length);
+
+                socketService.onAlert((alert) => {
+                    setAlerts(prevAlerts => {
+                        const newAlerts = [alert, ...prevAlerts];
+                        return newAlerts.slice(0, 100);
+                    });
+                });
+
+                socketService.onStats((newStats) => {
+                    const transformedStats: TransformedStats = {
+                        ...newStats,
+                        protocolDistribution: newStats.protocolDistribution.map(item => ({
+                            name: item.protocol.toUpperCase(),
+                            value: item.count
+                        }))
+                    };
+                    setStats(prevStats => ({
+                        ...transformedStats,
+                        // Preserve real-time counters
+                        totalPackets: Math.max(prevStats.totalPackets, transformedStats.totalPackets),
+                        packetsPerSecond: transformedStats.packetsPerSecond || prevStats.packetsPerSecond,
+                        totalBytes: Math.max(prevStats.totalBytes, transformedStats.totalBytes)
+                    }));
+                });
+
+                socketService.onStatus(({ status, interface: iface }: { status: string; interface?: string }) => {
+                    setIsCapturing(status === 'running');
+                    if (iface) {
+                        setSelectedInterface(iface);
+                    }
+                });
+
+                socketService.onSudoRequired(() => {
+                    setShowSudoPrompt(true);
+                });
+
+
+
+
+                // Fetch interfaces and initial stats
+                await socketService.fetchInterfaces();
+                await socketService.getStats();
+            } catch (error) {
+                console.error('Failed to setup socket:', error);
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                setError(`Failed to connect to server: ${errorMessage}`);
+            }
+        };
+
+        setupSocket();
+
+        return () => {
+            socketService.disconnect();
+        };
+    }, [navigate, selectedInterface, setError, setIsCapturing, setSudoPassword, setShowSudoPrompt, setPackets, setStats]);
+
+    // Monitor packet updates and update statistics
+    useEffect(() => {
+        if (packets.length > 0) {
+            console.log('Packets state updated, count:', packets.length);
+            // Update active connections and unique hosts
+            const activeConns = packets.filter(p => p.protocol === 'TCP' && p.flags?.includes('SYN')).length;
+            const uniqueHosts = new Set([...packets.map(p => p.source), ...packets.map(p => p.destination)]).size;
+            setStats(prev => ({
+                ...prev,
+                activeConnections: activeConns,
+                uniqueHosts: uniqueHosts
+            }));
+        }
+    }, [packets, setStats]);
+
+    const handleSudoSubmit = async () => {
+        setError('');
+        if (!sudoPassword) {
+            setError('Please enter sudo password');
+            return;
+        }
+        if (!selectedInterface) {
+            setError('Please select a network interface');
             return;
         }
 
         try {
-            socketService.connect();
-            fetchInterfaces();
-
-            const packetHandler = (packet: Packet) => {
-                setPackets(prev => [packet, ...prev].slice(0, 100));
+            console.log('Starting capture on interface:', selectedInterface);
+            // Set up sudo required handler before starting capture
+            const handleSudoRequired = () => {
+                console.log('Sudo required event received in Dashboard');
+                setError('Invalid sudo password');
+                setSudoPassword('');
+                // Keep the prompt open for retry
+                setShowSudoPrompt(true);
             };
 
-            const alertHandler = (alert: Alert) => {
-                setAlerts(prev => [alert, ...prev]);
-            };
+            socketService.onSudoRequired(handleSudoRequired);
 
-            const statsHandler = (newStats: StatsData) => {
-                setStats({
-                    totalPackets: newStats.totalPackets || 0,
-                    packetsPerSecond: newStats.packetsPerSecond || 0,
-                    protocolDistribution: newStats.protocolDistribution || []
-                });
-            };
-
-            const statusHandler = (status: { status: string, interface?: string }) => {
-                setIsCapturing(status.status === 'running');
-                if (status.interface) {
-                    setSelectedInterface(status.interface);
-                }
-            };
-
-            socketService.onPacket(packetHandler);
-            socketService.onAlert(alertHandler);
-            socketService.onStats(statsHandler);
-            socketService.onCaptureStatus(statusHandler);
-
-            // Fetch initial data
-            socketService.getStats().catch((error: Error) => {
-                console.error('Failed to fetch status:', error);
-                setError('Failed to fetch initial status');
+            await socketService.startCapture({
+                interface: selectedInterface,
+                sudoPassword: sudoPassword.trim() // Ensure no whitespace
             });
 
-            return () => {
-                socketService.offPacket(packetHandler);
-                socketService.offAlert(alertHandler);
-                socketService.offStats(statsHandler);
-                socketService.offCaptureStatus(statusHandler);
-                socketService.disconnect();
-            };
+            // Remove the handler after successful capture
+            socketService.offSudoRequired(handleSudoRequired);
+
+            console.log('Capture started successfully');
+            setSudoPassword('');
+            setShowSudoPrompt(false);
+            setCurrentPage(1);
+            setIsCapturing(true);
         } catch (error) {
-            console.error('Socket connection error:', error);
-            setError('Failed to connect to server');
-            navigate('/login');
+            console.error('Capture error:', error);
+            const errorMessage = error instanceof Error ? error.message : 'Failed to start capture';
+            setError(errorMessage);
+            
+            if (errorMessage.toLowerCase().includes('password')) {
+                setSudoPassword('');
+                setShowSudoPrompt(true); // Keep prompt open for password errors
+            } else {
+                setShowSudoPrompt(false);
+            }
         }
-    }, [navigate]);
+    };
 
     return (
         <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh', bgcolor: '#1a1f1a' }}>
+            <Dialog 
+                open={showSudoPrompt} 
+                onClose={() => setShowSudoPrompt(false)}
+                PaperProps={{
+                    sx: {
+                        bgcolor: '#2c332c',
+                        color: '#e0e0e0',
+                        border: '1px solid #4caf50'
+                    }
+                }}
+            >
+                <DialogTitle sx={{ color: '#4caf50' }}>Sudo Required</DialogTitle>
+                <DialogContent>
+                    <DialogContentText sx={{ color: '#e0e0e0', mb: 2 }}>
+                        Packet capture requires sudo privileges. Please enter your sudo password:
+                    </DialogContentText>
+                    <TextField
+                        autoFocus
+                        margin="dense"
+                        label="Sudo Password"
+                        type="password"
+                        fullWidth
+                        value={sudoPassword}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSudoPassword(e.target.value)}
+                        onKeyPress={(e: KeyboardEvent<HTMLInputElement>) => e.key === 'Enter' && handleSudoSubmit()}
+                        sx={{
+                            '& .MuiOutlinedInput-root': {
+                                color: '#e0e0e0',
+                                '& fieldset': { borderColor: '#4caf50' },
+                                '&:hover fieldset': { borderColor: '#66bb6a' },
+                                '&.Mui-focused fieldset': { borderColor: '#81c784' }
+                            },
+                            '& .MuiInputLabel-root': {
+                                color: '#4caf50',
+                                '&.Mui-focused': { color: '#81c784' }
+                            }
+                        }}
+                    />
+                </DialogContent>
+                <DialogActions>
+                    <Button 
+                        onClick={() => setShowSudoPrompt(false)} 
+                        sx={{ color: '#e0e0e0' }}
+                    >
+                        Cancel
+                    </Button>
+                    <Button 
+                        onClick={handleSudoSubmit}
+                        variant="contained"
+                        sx={{
+                            bgcolor: '#4caf50',
+                            '&:hover': { bgcolor: '#66bb6a' }
+                        }}
+                    >
+                        Submit
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
             <AppBar position="static" sx={{ bgcolor: '#2c332c', boxShadow: 'none', borderBottom: '1px solid #3c443c' }}>
                 <Toolbar>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -193,7 +408,7 @@ const Dashboard = () => {
                             <Select
                                 labelId="interface-select-label"
                                 value={selectedInterface}
-                                onChange={(e) => setSelectedInterface(e.target.value)}
+                                onChange={(e: SelectChangeEvent<string>) => setSelectedInterface(e.target.value)}
                                 disabled={isCapturing}
                                 label="Network Interface"
                                 sx={{
@@ -210,7 +425,7 @@ const Dashboard = () => {
                                 }}
                             >
                                 {interfaces.map((iface) => (
-                                    <MenuItem key={iface.id} value={iface.name}>
+                                    <MenuItem key={iface.name} value={iface.name}>
                                         {iface.name} {iface.description ? `(${iface.description})` : ''}
                                     </MenuItem>
                                 ))}
@@ -256,7 +471,7 @@ const Dashboard = () => {
                 <Box sx={{ width: '30%', display: 'flex', flexDirection: 'column', gap: 2 }}>
                     {/* Statistics */}
                     <Paper elevation={0} sx={{ p: 2, bgcolor: '#2c332c', border: '1px solid #3c443c', color: '#e0e0e0' }}>
-                        <Statistics stats={stats} />
+                        <StatsComponent stats={stats} />
                     </Paper>
 
                     {/* Network Summary */}
@@ -306,7 +521,7 @@ const Dashboard = () => {
                                         }}
                                     >
                                         <Typography variant="caption" sx={{ color: '#ff4444', display: 'block' }}>
-                                            {alert.type}
+                                            {alert.severity.toUpperCase()}: {alert.message}
                                         </Typography>
                                     </Box>
                                 ))}
@@ -369,7 +584,13 @@ const Dashboard = () => {
                                         </TableRow>
                                     </TableHead>
                                     <TableBody>
-                                        {packets
+                                        {packets.length === 0 ? (
+                                            <TableRow>
+                                                <TableCell colSpan={5} sx={{ textAlign: 'center', color: '#808080' }}>
+                                                    No packets captured yet. Start capture to see network activity.
+                                                </TableCell>
+                                            </TableRow>
+                                        ) : packets
                                             .slice((currentPage - 1) * packetsPerPage, currentPage * packetsPerPage)
                                             .map((packet, index) => (
                                             <TableRow 
@@ -464,7 +685,7 @@ const Dashboard = () => {
                                             }}
                                         >
                                             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                                <span style={{ color: '#ff4444', fontWeight: 500 }}>{alert.type}</span>
+                                                <span style={{ color: '#ff4444', fontWeight: 500 }}>{alert.severity.toUpperCase()}</span>
                                                 <span style={{ color: '#808080', fontSize: '0.8rem' }}>
                                                     {new Date(alert.timestamp).toLocaleTimeString()}
                                                 </span>
